@@ -34,6 +34,7 @@ header { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content:
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
 .dot.on { background: var(--green); box-shadow: 0 0 8px var(--green); }
 .dot.off { background: var(--red); }
+.dot.replay { background: var(--amber); box-shadow: 0 0 8px var(--amber); }
 label.amount { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 12px; }
 input { width: 80px; background: var(--panel); border: 1px solid var(--line); color: var(--text); border-radius: 8px; padding: 8px; font-family: var(--mono); }
 button { background: var(--gold); color: #111; border: 0; border-radius: 8px; padding: 9px 14px; font-weight: 700; cursor: pointer; }
@@ -65,6 +66,9 @@ tr:last-child td { border-bottom: 0; }
 .cell.toxic { background: var(--red-bg); border-color: rgba(255, 92, 108, 0.35); }
 .cell.toxic .price { color: var(--red); }
 .cell.toxic .tag { background: var(--red); color: #fff; }
+.cell.suspect { background: rgba(255, 181, 71, 0.12); border-color: rgba(255, 181, 71, 0.35); }
+.cell.suspect .price { color: var(--amber); }
+.cell.suspect .tag { background: var(--amber); color: #2a1a00; }
 .cell.na { color: var(--muted); }
 .cell.na .tag { background: transparent; border: 1px dashed var(--line); color: var(--muted); }
 .neg { color: var(--green); }
@@ -96,7 +100,7 @@ footer { color: var(--muted); font-size: 12px; text-align: center; margin-top: 2
 
   <section class="kpis">
     <div class="kpi"><div class="label">Tickers scanned</div><div class="value" id="kTickers">-</div></div>
-    <div class="kpi"><div class="label">Toxic quotes blocked</div><div class="value red" id="kToxic">-</div></div>
+    <div class="kpi"><div class="label">Toxic / suspect blocked</div><div class="value red" id="kToxic">-</div></div>
     <div class="kpi"><div class="label">Max loss avoided</div><div class="value red" id="kLoss">-</div></div>
     <div class="kpi"><div class="label">Widest safe spread</div><div class="value amber" id="kSpread">-</div></div>
     <div class="kpi"><div class="label">Best discount vs ref</div><div class="value green" id="kDiscount">-</div></div>
@@ -136,7 +140,7 @@ footer { color: var(--muted); font-size: 12px; text-align: center; margin-top: 2
             <th>Time</th>
             <th>Order</th>
             <th>Route</th>
-            <th>vs ref</th>
+            <th>Fill vs quote</th>
             <th>Toxic blocked</th>
             <th>Status</th>
           </tr>
@@ -151,8 +155,8 @@ footer { color: var(--muted); font-size: 12px; text-align: center; margin-top: 2
     <div class="how">
       <div><b>1 · Resolve</b>Every ticker is mapped to its bStocks, Ondo and xStocks contracts on BSC from Binance's tokenized-securities registry.</div>
       <div><b>2 · Quote &amp; normalize</b>Each issuer is quoted for the same USDT amount via <code>baw market-order quote</code>, then divided by its live share multiplier so prices are compared per real share.</div>
-      <div><b>3 · Shield</b>Each fill is checked against the US last price (or the oracle median when the US price is missing). Anything more than <span id="threshold">300</span> bps above reference is flagged toxic and never routed.</div>
-      <div><b>4 · Execute</b>The cheapest safe route is executed with <code>baw market-order swap</code> and only reported as done after the order reaches <code>FINISHED</code>.</div>
+      <div><b>3 · Shield</b>Each fill is checked against the US last price (or the oracle median when the US price is missing). Anything more than <span id="threshold">300</span> bps above reference is flagged toxic, and anything more than <span id="suspectThreshold">500</span> bps below it is held back as suspect data. Neither is ever routed.</div>
+      <div><b>4 · Execute</b>The cheapest safe route is executed with <code>baw market-order swap</code>, only reported as done after the order reaches <code>FINISHED</code>, then verified by measuring the tokens actually received.</div>
     </div>
   </section>
 
@@ -168,7 +172,7 @@ const signedBps = (value) => value === null || value === undefined ? "-" : (valu
 const bpsClass = (value) => value === null || value === undefined ? "" : value < 0 ? "neg" : "pos";
 
 function renderCell(row, issuer) {
-  const quote = row.quotes.find((item) => item.issuer === issuer);
+  const quote = (row.quotes ?? []).find((item) => item.issuer === issuer);
   if (!quote) {
     return '<div class="cell na"><div class="price">not listed</div></div>';
   }
@@ -180,6 +184,9 @@ function renderCell(row, issuer) {
     const loss = row.best ? row.usdtAmount * (1 - quote.sharesOut / row.best.sharesOut) : null;
     return `<div class="cell toxic"><div class="price">${money(quote.pricePerShare)}</div>${premium}<span class="tag">☠ TOXIC${loss !== null ? " · −" + money(loss) : ""}</span></div>`;
   }
+  if (quote.suspect) {
+    return `<div class="cell suspect"><div class="price">${money(quote.pricePerShare)}</div><div class="sub pos">${signedBps(quote.premiumBps)} vs ref</div><span class="tag">⚠ SUSPECT</span></div>`;
+  }
   const isBest = row.best && row.best.issuer === issuer;
   return `<div class="cell ${isBest ? "best" : "safe"}"><div class="price">${money(quote.pricePerShare)}</div>${premium}<span class="tag">${isBest ? "★ BEST" : escapeHtml(quote.symbol)}</span></div>`;
 }
@@ -187,6 +194,7 @@ function renderCell(row, issuer) {
 function renderRadar(payload) {
   const rows = payload.rows;
   $("threshold").textContent = payload.toxicThresholdBps;
+  $("suspectThreshold").textContent = payload.suspectThresholdBps ?? 500;
   if (!rows.length) {
     $("radar").innerHTML = '<tr><td colspan="6" class="empty">No tickers returned.</td></tr>';
     return;
@@ -194,7 +202,7 @@ function renderRadar(payload) {
   $("radar").innerHTML = rows.map((row) => {
     const reference = row.reference?.price ? `<div class="price">${money(row.reference.price)}</div><div class="sub">${row.reference.source === "us-stock-last" ? "US last" : "oracle median"}${row.reference.marketStatus ? " · " + escapeHtml(row.reference.marketStatus) : ""}</div>` : '<div class="sub">no reference</div>';
     const flip = row.multiplierFlipsWinner ? '<div class="sub pos">multiplier flips winner</div>' : "";
-    const spread = row.spreadBps === null ? "-" : `${row.spreadBps.toFixed(1)} bps<div class="sub">saves ${money(row.savingsUsd, 4)}</div>`;
+    const spread = row.spreadBps == null ? "-" : `${row.spreadBps.toFixed(1)} bps<div class="sub">saves ${money(row.savingsUsd, 4)}</div>`;
     return `<tr>
       <td><div class="ticker">${escapeHtml(row.ticker)}</div><div class="sub">${row.issuersSafe ?? 0} safe / ${row.issuersListed ?? 0}</div>${flip}</td>
       <td>${reference}</td>
@@ -207,15 +215,22 @@ function renderRadar(payload) {
 function renderKpis(payload) {
   const rows = payload.rows;
   const toxicCount = rows.reduce((total, row) => total + (row.toxic?.length ?? 0), 0);
+  const suspectCount = rows.reduce((total, row) => total + (row.suspect?.length ?? 0), 0);
   const maxLoss = Math.max(0, ...rows.map((row) => row.maxLossAvoidedUsd ?? 0));
-  const widest = rows.filter((row) => row.spreadBps !== null).sort((a, b) => b.spreadBps - a.spreadBps)[0];
-  const discount = rows.filter((row) => row.bestVsReferenceBps !== null && row.bestVsReferenceBps < 0).sort((a, b) => a.bestVsReferenceBps - b.bestVsReferenceBps)[0];
+  const widest = rows.filter((row) => row.spreadBps != null).sort((a, b) => b.spreadBps - a.spreadBps)[0];
+  const discount = rows.filter((row) => row.bestVsReferenceBps != null && row.bestVsReferenceBps < 0).sort((a, b) => a.bestVsReferenceBps - b.bestVsReferenceBps)[0];
   $("kTickers").textContent = rows.length;
-  $("kToxic").textContent = toxicCount;
+  $("kToxic").textContent = `${toxicCount} / ${suspectCount}`;
   $("kLoss").textContent = maxLoss > 0 ? money(maxLoss) + " / " + money(payload.usdtAmount, 0) : "$0";
   $("kSpread").textContent = widest ? `${widest.spreadBps.toFixed(0)} bps ${widest.ticker}` : "-";
   $("kDiscount").textContent = discount ? `${Math.abs(discount.bestVsReferenceBps).toFixed(0)} bps ${discount.ticker}` : "-";
-  $("scanMeta").textContent = `${new Date(payload.scannedAt).toLocaleTimeString()} · ${(payload.durationMs / 1000).toFixed(1)}s · ${payload.usdtAmount} USDT${payload.cached ? " · cached" : ""}`;
+  const when = payload.replay ? new Date(payload.scannedAt).toLocaleString() : new Date(payload.scannedAt).toLocaleTimeString();
+  $("scanMeta").textContent = `${payload.replay ? "REPLAY · captured " : ""}${when} · ${(payload.durationMs / 1000).toFixed(1)}s · ${payload.usdtAmount} USDT${payload.cached && !payload.replay ? " · cached" : ""}`;
+  if (payload.replay) {
+    $("rescan").disabled = true;
+    $("rescan").textContent = "Replay mode";
+    $("usdt").disabled = true;
+  }
 }
 
 async function loadScan(refresh = false) {
@@ -234,8 +249,10 @@ async function loadScan(refresh = false) {
   } catch (error) {
     $("radar").innerHTML = `<tr><td colspan="6" class="empty">${escapeHtml(error.message)}</td></tr>`;
   } finally {
-    button.disabled = false;
-    button.textContent = "Rescan";
+    if (button.textContent !== "Replay mode") {
+      button.disabled = false;
+      button.textContent = "Rescan";
+    }
   }
 }
 
@@ -248,11 +265,14 @@ async function loadTrades() {
     $("trades").innerHTML = trades.slice(0, 20).map((trade) => {
       const tx = trade.txHash ? `<div class="sub"><a href="https://bscscan.com/tx/${escapeHtml(trade.txHash)}" target="_blank" rel="noopener">view tx ↗</a></div>` : "";
       const blocked = trade.toxicBlocked?.length ? `${escapeHtml(trade.toxicBlocked.join(", "))}<div class="sub">avoided ${money(trade.lossAvoidedUsd)}</div>` : "-";
+      const fill = trade.fillVerified
+        ? `<span class="${bpsClass(trade.executionVsQuoteBps)}">${signedBps(trade.executionVsQuoteBps)}</span><div class="sub">filled ${money(trade.actualPricePerShare)} / share</div>`
+        : '<span class="sub">not verified</span>';
       return `<tr>
         <td><div class="sub">${new Date(trade.at).toLocaleString()}</div></td>
         <td>${escapeHtml(trade.usdtAmount)} USDT → ${escapeHtml(trade.ticker)}</td>
-        <td>${escapeHtml(trade.route)}<div class="sub">${money(trade.quotedPricePerShare)} / share</div></td>
-        <td class="${bpsClass(trade.premiumBps)}">${signedBps(trade.premiumBps)}</td>
+        <td>${escapeHtml(trade.route)}<div class="sub">quoted ${money(trade.quotedPricePerShare)} / share · ${signedBps(trade.premiumBps)} vs ref</div></td>
+        <td>${fill}</td>
         <td>${blocked}</td>
         <td><span class="status-${escapeHtml(trade.status)}">${escapeHtml(trade.status)}</span>${tx}</td>
       </tr>`;
@@ -263,7 +283,12 @@ async function loadTrades() {
 
 async function loadWallet() {
   try {
-    const { connected } = await (await fetch("/api/wallet")).json();
+    const { connected, replay } = await (await fetch("/api/wallet")).json();
+    if (replay) {
+      $("walletDot").className = "dot replay";
+      $("walletLabel").textContent = "Replay mode · recorded live scan";
+      return;
+    }
     $("walletDot").className = "dot " + (connected ? "on" : "off");
     $("walletLabel").textContent = connected ? "Agentic Wallet connected" : "Agentic Wallet offline";
   } catch {

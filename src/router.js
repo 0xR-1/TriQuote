@@ -4,6 +4,7 @@ import { getReference } from "./reference.js";
 
 export const DEFAULT_WATCHLIST = ["NVDA", "TSLA", "AAPL", "MSFT", "META", "GOOGL", "AMZN", "SPY", "QQQ", "COIN"];
 export const TOXIC_PREMIUM_BPS = 300;
+export const SUSPECT_DISCOUNT_BPS = 500;
 const DEFAULT_CONCURRENCY = 3;
 
 async function rawQuote(listing, usdtAmount) {
@@ -31,7 +32,7 @@ function enrichQuote(quote, listing, usdtAmount, reference) {
   const multiplierSource = oracle?.multiplier ? "dynamic" : "list";
   const enriched = { ...quote, multiplier, multiplierSource, oraclePricePerShare: oracle?.oraclePricePerShare ?? null };
   if (!quote.available) {
-    return { ...enriched, toxic: false, premiumBps: null };
+    return { ...enriched, toxic: false, suspect: false, premiumBps: null };
   }
   const sharesOut = quote.tokensOut * multiplier;
   const pricePerShare = usdtAmount / sharesOut;
@@ -42,7 +43,8 @@ function enrichQuote(quote, listing, usdtAmount, reference) {
     pricePerShare,
     naivePricePerToken: usdtAmount / quote.tokensOut,
     premiumBps,
-    toxic: premiumBps !== null && premiumBps > TOXIC_PREMIUM_BPS
+    toxic: premiumBps !== null && premiumBps > TOXIC_PREMIUM_BPS,
+    suspect: premiumBps !== null && premiumBps < -SUSPECT_DISCOUNT_BPS
   };
 }
 
@@ -51,7 +53,7 @@ export async function quoteTicker(ticker, usdtAmount) {
   const listings = await getListings(symbol);
   const quotedAt = new Date().toISOString();
   if (listings.length === 0) {
-    return { ticker: symbol, usdtAmount, quotedAt, quotes: [], available: [], best: null, worst: null, toxic: [], error: "Ticker not found on BSC" };
+    return { ticker: symbol, usdtAmount, quotedAt, quotes: [], available: [], best: null, worst: null, toxic: [], suspect: [], error: "Ticker not found on BSC" };
   }
   const [reference, rawQuotes] = await Promise.all([
     getReference(listings),
@@ -60,7 +62,8 @@ export async function quoteTicker(ticker, usdtAmount) {
   const quotes = rawQuotes.map((quote, index) => enrichQuote(quote, listings[index], usdtAmount, reference));
   const live = quotes.filter((quote) => quote.available);
   const toxic = live.filter((quote) => quote.toxic);
-  const safe = live.filter((quote) => !quote.toxic).sort((a, b) => b.sharesOut - a.sharesOut);
+  const suspect = live.filter((quote) => quote.suspect);
+  const safe = live.filter((quote) => !quote.toxic && !quote.suspect).sort((a, b) => b.sharesOut - a.sharesOut);
   const best = safe[0] ?? null;
   const worst = safe.length > 1 ? safe[safe.length - 1] : null;
   const naiveBest = [...safe].sort((a, b) => b.tokensOut - a.tokensOut)[0] ?? null;
@@ -78,6 +81,7 @@ export async function quoteTicker(ticker, usdtAmount) {
     quotes,
     available: safe,
     toxic,
+    suspect,
     best,
     worst,
     issuersListed: listings.length,
@@ -133,5 +137,6 @@ export async function scan({ tickers, all = false, usdtAmount = 5, concurrency =
     onProgress({ completed, total: scanTickers.length, row });
     return row;
   });
-  return rows.sort((a, b) => (b.toxic?.length ?? 0) - (a.toxic?.length ?? 0) || (b.spreadBps ?? -1) - (a.spreadBps ?? -1));
+  const flagged = (row) => (row.toxic?.length ?? 0) + (row.suspect?.length ?? 0);
+  return rows.sort((a, b) => flagged(b) - flagged(a) || (b.spreadBps ?? -1) - (a.spreadBps ?? -1));
 }

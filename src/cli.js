@@ -1,12 +1,14 @@
 #!/usr/bin/env node
-import { appendFile, mkdir } from "node:fs/promises";
-import { dirname, join } from "node:path";
+import { appendFile, mkdir, writeFile } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { quoteTicker, scan, TOXIC_PREMIUM_BPS } from "./router.js";
-import { submitSwap, waitForTerminalOrder, walletStatus } from "./baw.js";
+import { quoteTicker, scan, TOXIC_PREMIUM_BPS, SUSPECT_DISCOUNT_BPS } from "./router.js";
+import { submitSwap, tokenBalance, waitForTerminalOrder, walletStatus } from "./baw.js";
 import { USDT_BSC } from "./registry.js";
 
 const MAX_TRADE_USDT = 5;
+const BALANCE_POLL_ATTEMPTS = 6;
+const BALANCE_POLL_INTERVAL_MS = 3000;
 const PROJECT_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 export const TRADE_LOG_FILE = join(PROJECT_ROOT, ".cache", "trades.jsonl");
 
@@ -18,6 +20,8 @@ const color = {
   dim: (text) => `\x1b[2m${text}\x1b[0m`,
   bold: (text) => `\x1b[1m${text}\x1b[0m`
 };
+
+const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
 
 function parseArgs(argv) {
   const positional = [];
@@ -73,6 +77,10 @@ function printTickerSummary(summary) {
       console.log(color.red(`  ☠ ${core}   TOXIC${loss !== null ? ` · would lose ${usd(loss, 2)}` : ""}`));
       continue;
     }
+    if (quote.suspect) {
+      console.log(color.yellow(`  ⚠ ${core}   SUSPECT · too cheap vs reference, not routed`));
+      continue;
+    }
     console.log(isBest ? color.green(`  ★ ${core}`) : `  · ${core}`);
   }
   if (summary.spreadBps !== null) {
@@ -84,35 +92,56 @@ function printTickerSummary(summary) {
   if (summary.maxLossAvoidedUsd !== null) {
     console.log(color.red(`  blocked ${summary.toxic.length} toxic quote(s) priced >${TOXIC_PREMIUM_BPS} bps over reference · avoided losing up to ${usd(summary.maxLossAvoidedUsd, 2)}`));
   }
+  if (summary.suspect?.length > 0) {
+    console.log(color.yellow(`  held back ${summary.suspect.length} suspect quote(s) priced >${SUSPECT_DISCOUNT_BPS} bps under reference (likely bad data, not a bargain)`));
+  }
   if (summary.multiplierFlipsWinner) {
     console.log(color.yellow("  ! raw token amounts point to a different issuer; share multipliers change the winner"));
   }
 }
 
+function flagLabel(row) {
+  const toxic = (row.toxic ?? []).map((quote) => `☠ ${quote.symbol}`);
+  const suspect = (row.suspect ?? []).map((quote) => `⚠ ${quote.symbol}`);
+  const labels = [...toxic, ...suspect];
+  return labels.length > 0 ? labels.join(" ") : "-";
+}
+
 function printScanTable(rows) {
-  console.log(color.bold("\nTICKER  SAFE  BEST                 BEST $/SHARE    VS REF      SPREAD   TOXIC"));
+  console.log(color.bold("\nTICKER  SAFE  BEST                 BEST $/SHARE    VS REF      SPREAD   FLAGS"));
   for (const row of rows) {
     const safe = `${row.issuersSafe ?? 0}/${row.issuersListed ?? 0}`;
     const best = row.best ? `${row.best.issuerName} ${row.best.symbol}` : "none";
-    const toxicCount = row.toxic?.length ?? 0;
-    const toxicLabel = toxicCount > 0 ? `☠ ${row.toxic.map((quote) => quote.symbol).join(",")}` : "-";
-    const line = `${row.ticker.padEnd(7)} ${safe.padEnd(5)} ${best.padEnd(20)} ${usd(row.best?.pricePerShare, 4).padStart(13)}  ${signedBps(row.bestVsReferenceBps).padStart(9)}  ${bps(row.spreadBps).padStart(10)}   ${toxicLabel}`;
-    if (toxicCount > 0) {
+    const line = `${row.ticker.padEnd(7)} ${safe.padEnd(5)} ${best.padEnd(20)} ${usd(row.best?.pricePerShare, 4).padStart(13)}  ${signedBps(row.bestVsReferenceBps).padStart(9)}  ${bps(row.spreadBps).padStart(10)}   ${flagLabel(row)}`;
+    if ((row.toxic?.length ?? 0) > 0) {
       console.log(color.red(line));
-    } else if (row.spreadBps !== null && row.spreadBps >= 30) {
+    } else if ((row.suspect?.length ?? 0) > 0 || (row.spreadBps !== null && row.spreadBps >= 30)) {
       console.log(color.yellow(line));
     } else {
       console.log(line);
     }
   }
   const toxicTotal = rows.reduce((total, row) => total + (row.toxic?.length ?? 0), 0);
-  if (toxicTotal > 0) {
-    console.log(color.red(`\n${toxicTotal} toxic quote(s) blocked across ${rows.length} tickers`));
+  const suspectTotal = rows.reduce((total, row) => total + (row.suspect?.length ?? 0), 0);
+  if (toxicTotal > 0 || suspectTotal > 0) {
+    console.log(color.red(`\n${toxicTotal} toxic and ${suspectTotal} suspect quote(s) kept out of routing across ${rows.length} tickers`));
   }
+}
+
+export function buildScanPayload(rows, usdtAmount, startedAt) {
+  return {
+    scannedAt: new Date().toISOString(),
+    durationMs: Date.now() - startedAt,
+    usdtAmount,
+    toxicThresholdBps: TOXIC_PREMIUM_BPS,
+    suspectThresholdBps: SUSPECT_DISCOUNT_BPS,
+    rows
+  };
 }
 
 async function commandScan(positional, flags) {
   const usdtAmount = Number(flags.usdt ?? 5);
+  const startedAt = Date.now();
   const rows = await scan({
     tickers: positional,
     all: Boolean(flags.all),
@@ -123,6 +152,12 @@ async function commandScan(positional, flags) {
       }
     }
   });
+  if (typeof flags.save === "string") {
+    const target = resolve(flags.save);
+    await mkdir(dirname(target), { recursive: true });
+    await writeFile(target, `${JSON.stringify(buildScanPayload(rows, usdtAmount, startedAt), null, 2)}\n`);
+    process.stderr.write(color.green(`  saved scan snapshot to ${target}\n`));
+  }
   if (flags.json) {
     console.log(JSON.stringify(rows, null, 2));
     return;
@@ -148,6 +183,28 @@ async function logTrade(entry) {
   await appendFile(TRADE_LOG_FILE, `${JSON.stringify(entry)}\n`);
 }
 
+async function measureFill(route, usdtAmount, balanceBefore, referencePrice) {
+  if (balanceBefore === null) {
+    return { verified: false, reason: "balance before the swap could not be read" };
+  }
+  for (let attempt = 0; attempt < BALANCE_POLL_ATTEMPTS; attempt++) {
+    const after = await tokenBalance(route.address);
+    if (after.success && after.balance > balanceBefore) {
+      const receivedTokens = after.balance - balanceBefore;
+      const actualPricePerShare = usdtAmount / (receivedTokens * route.multiplier);
+      return {
+        verified: true,
+        receivedTokens,
+        actualPricePerShare,
+        executionVsQuoteBps: ((actualPricePerShare - route.pricePerShare) / route.pricePerShare) * 10000,
+        actualVsReferenceBps: referencePrice ? ((actualPricePerShare - referencePrice) / referencePrice) * 10000 : null
+      };
+    }
+    await sleep(BALANCE_POLL_INTERVAL_MS);
+  }
+  return { verified: false, reason: "token balance did not increase within the polling window" };
+}
+
 async function commandBuy(positional, flags) {
   const ticker = positional[0];
   const usdtAmount = Number(flags.usdt);
@@ -164,7 +221,8 @@ async function commandBuy(positional, flags) {
   const summary = await quoteTicker(ticker, usdtAmount);
   printTickerSummary(summary);
   if (!summary.best) {
-    const reason = summary.toxic?.length > 0 ? "every live quote is toxic" : "no issuer has live liquidity";
+    const flagged = (summary.toxic?.length ?? 0) + (summary.suspect?.length ?? 0);
+    const reason = flagged > 0 ? "every live quote is toxic or suspect" : "no issuer has live liquidity";
     throw new Error(`Refusing to route ${summary.ticker}: ${reason} right now`);
   }
   const route = summary.best;
@@ -173,6 +231,8 @@ async function commandBuy(positional, flags) {
     console.log(color.yellow("Dry run only. Re-run with --confirm to execute this swap on BSC mainnet."));
     return;
   }
+  const before = await tokenBalance(route.address);
+  const balanceBefore = before.success ? before.balance : null;
   const submitted = await submitSwap({
     fromToken: USDT_BSC,
     toToken: route.address,
@@ -189,6 +249,9 @@ async function commandBuy(positional, flags) {
     process.stderr.write(color.dim(`  status ${order.status}\n`));
   });
   const order = outcome.order;
+  const fill = outcome.terminal && order.status === "FINISHED"
+    ? await measureFill(route, usdtAmount, balanceBefore, summary.reference?.price ?? null)
+    : { verified: false, reason: "order did not finish" };
   await logTrade({
     at: new Date().toISOString(),
     ticker: summary.ticker,
@@ -201,7 +264,13 @@ async function commandBuy(positional, flags) {
     spreadBps: summary.spreadBps,
     savingsUsd: summary.savingsUsd,
     toxicBlocked: summary.toxic.map((quote) => quote.symbol),
+    suspectHeld: (summary.suspect ?? []).map((quote) => quote.symbol),
     lossAvoidedUsd: summary.maxLossAvoidedUsd,
+    fillVerified: fill.verified,
+    receivedTokens: fill.receivedTokens ?? null,
+    actualPricePerShare: fill.actualPricePerShare ?? null,
+    executionVsQuoteBps: fill.executionVsQuoteBps ?? null,
+    actualVsReferenceBps: fill.actualVsReferenceBps ?? null,
     orderId,
     status: order?.status ?? "UNKNOWN",
     txHash: order?.txHash ?? null
@@ -212,6 +281,11 @@ async function commandBuy(positional, flags) {
   }
   if (order.status === "FINISHED") {
     console.log(color.green(`FINISHED  tx https://bscscan.com/tx/${order.txHash}`));
+    if (fill.verified) {
+      console.log(color.green(`Filled ${fill.receivedTokens} ${route.symbol} → ${usd(fill.actualPricePerShare, 4)}/share · ${signedBps(fill.executionVsQuoteBps)} vs quote · ${signedBps(fill.actualVsReferenceBps)} vs ref`));
+    } else {
+      console.log(color.yellow(`Fill not verified: ${fill.reason}`));
+    }
     return;
   }
   console.log(color.red(`FAILED  order ${orderId}${order.txHash ? ` tx https://bscscan.com/tx/${order.txHash}` : " (no tx hash)"}`));
@@ -224,7 +298,7 @@ async function main() {
   const [commandName, ...rest] = process.argv.slice(2);
   const command = COMMANDS[commandName];
   if (!command) {
-    console.log("Usage:\n  node src/cli.js scan [TICKERS...] [--all] [--usdt 5] [--json]\n  node src/cli.js best <TICKER> [--usdt 5] [--json]\n  node src/cli.js buy <TICKER> --usdt <amount<=5> [--confirm] [--slippage 1]");
+    console.log("Usage:\n  node src/cli.js scan [TICKERS...] [--all] [--usdt 5] [--json] [--save snapshots/scan.json]\n  node src/cli.js best <TICKER> [--usdt 5] [--json]\n  node src/cli.js buy <TICKER> --usdt <amount<=5> [--confirm] [--slippage 1]");
     process.exitCode = commandName ? 1 : 0;
     return;
   }
@@ -232,7 +306,10 @@ async function main() {
   await command(positional, flags);
 }
 
-main().catch((error) => {
-  console.error(color.red(`Error: ${error.message}`));
-  process.exitCode = 1;
-});
+const isEntrypoint = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isEntrypoint) {
+  main().catch((error) => {
+    console.error(color.red(`Error: ${error.message}`));
+    process.exitCode = 1;
+  });
+}

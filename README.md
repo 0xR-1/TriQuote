@@ -23,6 +23,7 @@ All numbers below were produced by TriQuote against BSC mainnet for a 5 USDT ord
 | Finding | Detail |
 |---|---|
 | **Toxic quote returned as success** | `SPYx` quoted at **$8,912 / share** vs a US reference of **$779.87**. Routing there would lose **$4.57 of $5 (91%)**. `baw market-order quote` returned `success: true` with no warning. TriQuote flagged and blocked it. |
+| **It is a mispriced route, not a units bug** | Re-quoting `SPYx` at 0.5, 5 and 50 USDT gave **$8,944, $8,964 and $9,161 per token** — about **11.5× the reference at every size**. A decimals error would be an exact power of ten; thin depth would start near the reference and climb. Instead the route itself is priced ~11.5× off from the first cent. |
 | **Multiplier flips the winner** | On SPY, META, QQQ and AAPL the issuer that returns the most *tokens* is **not** the issuer that returns the most *shares*. |
 | **Off-hours discount** | Best safe SPY route (`SPYon`) filled **74 bps below** the last US price. |
 | **Fragmented coverage** | Binance's registry lists **40 tickers on all three issuers** and **121 on at least two** on BSC. |
@@ -35,7 +36,10 @@ All numbers below were produced by TriQuote against BSC mainnet for a 5 USDT ord
 - **Per-share normalization** — `pricePerShare = usdtIn / (tokensOut × multiplier)`, using the live multiplier from Binance.
 - **Reference price** — US last price from Binance's tokenized-securities API, falling back to the median oracle price per share.
 - **Toxic-quote shield** — any quote more than **300 bps** above reference is excluded from routing and reported with the loss it would have caused.
+- **Suspect-data guard** — any quote more than **500 bps** *below* reference is held back as likely bad data (wrong multiplier, broken pool) instead of being crowned the cheapest route.
 - **Best-route execution** — buys the cheapest safe issuer via `baw market-order swap`, hard-capped at **5 USDT**, dry-run by default, and only reported as done once the order reaches `FINISHED`.
+- **Fill verification** — after a swap finishes, TriQuote measures the tokens actually received (wallet balance before vs after) and logs the real price per share against both the quote and the reference.
+- **Replay mode** — `scan --save` records a live scan; the dashboard can replay it with no wallet, so anyone can inspect real results.
 - **Live dashboard** — local web UI with KPIs, per-issuer cells (★ BEST / ☠ TOXIC / NO LIQUIDITY) and an execution log.
 - **Agent-to-agent service** — a BNB Agent Studio seller agent (ERC-8004 identity **#2586**) that sells TriQuote route reports to other agents over A2A and MCP, paid through ERC-8183 escrow.
 
@@ -76,7 +80,9 @@ flowchart TD
         RT[Normalize per share] --> P[Premium vs reference]
         P --> T{More than 300 bps<br/>above reference?}
         T -->|yes| X[☠ Toxic<br/>blocked]
-        T -->|no| S[✓ Safe]
+        T -->|no| D{More than 500 bps<br/>below reference?}
+        D -->|yes| SU[⚠ Suspect<br/>held back]
+        D -->|no| S[✓ Safe]
         S --> B[★ Rank by shares out<br/>pick best]
     end
 
@@ -85,13 +91,15 @@ flowchart TD
     SRV --> UI[public/index.html<br/>live dashboard]
     CLI -->|confirmed buy| SW[baw market-order swap<br/>max 5 USDT]
     SW --> PL{Poll order}
-    PL -->|FINISHED| OK([Done · BscScan tx])
+    PL -->|FINISHED| OK([Done · BscScan tx<br/>fill measured from balance])
     PL -->|FAILED| KO([Reported as failed])
 
     classDef toxic fill:#ff5c6c,stroke:#ff5c6c,color:#fff
     classDef best fill:#2fd98b,stroke:#2fd98b,color:#062
     classDef wallet fill:#f0b90b,stroke:#f0b90b,color:#111
+    classDef suspect fill:#ffb547,stroke:#ffb547,color:#2a1a00
     class X toxic
+    class SU suspect
     class B,OK best
     class Q,SW wallet
 ```
@@ -103,7 +111,8 @@ flowchart TD
 | `src/reference.js` | Reference price, live multipliers and market status per issuer |
 | `src/router.js` | Quotes all issuers in parallel, normalizes, flags toxic quotes, ranks routes |
 | `src/cli.js` | `scan`, `best`, `buy` commands |
-| `src/server.js` | Local HTTP API + dashboard server |
+| `src/server.js` | Local HTTP API + dashboard server, with `--replay` for recorded scans |
+| `snapshots/` | Recorded live scans for replay |
 | `public/index.html` | Dashboard UI (no external dependencies) |
 
 ## TriQuote as an agent (BNB Agent Studio)
@@ -140,6 +149,8 @@ sequenceDiagram
 ```
 
 The agent sells **route intelligence**, not execution: the report ends with the exact `baw market-order swap` command, so the buyer executes in its own Agentic Wallet and never hands over funds.
+
+> **Where it runs.** The work hook imports the TriQuote engine from this repository's `src/` folder and quotes through the local `baw` session. It is meant to run with `bag dev` on a machine that has both. It has **not** been deployed to a hosted runtime: a deployed bundle would contain only `app/agent` and no signed-in `baw`, so every route would come back unavailable. The on-chain identity (#2586) therefore advertises a `localhost` endpoint.
 
 Example deliverable (live, 10 Oct 2026):
 
@@ -184,6 +195,16 @@ curl -s http://localhost:9000/ -H 'Content-Type: application/json' -d '{"jsonrpc
 
 ## Run it
 
+### Fastest: replay a recorded live scan (no wallet needed)
+
+```bash
+git clone https://github.com/0xR-1/TriQuote.git
+cd TriQuote
+node src/server.js --replay snapshots/scan-2026-10-10.json
+```
+
+Open <http://localhost:4173>. This replays a real scan captured on BSC mainnet on 10 Oct 2026 (US market off-hours), including the toxic `SPYx` quote.
+
 ### Prerequisites
 
 - Node.js **20+**
@@ -215,6 +236,7 @@ node src/cli.js best SPY
 node src/cli.js scan
 node src/cli.js scan NVDA TSLA AAPL --usdt 5
 node src/cli.js scan --all
+node src/cli.js scan --save snapshots/my-scan.json
 node src/cli.js buy NVDA --usdt 5
 node src/cli.js buy NVDA --usdt 5 --confirm
 ```
@@ -239,15 +261,17 @@ SPY  ·  5 USDT  ·  2 safe / 3 live / 3 listed
 
 ```bash
 node src/server.js
+node src/server.js --replay snapshots/scan-2026-10-10.json
 ```
 
-Open <http://localhost:4173>. The first scan of 10 tickers takes roughly 15–30 seconds; results are cached for 60 seconds.
+Open <http://localhost:4173>. A live scan of 10 tickers takes roughly 15–30 seconds; results are cached for 60 seconds. In replay mode the dashboard shows the recorded scan and never calls the wallet.
 
 ## Safety
 
 - Every live trade is capped at **5 USDT** in code.
 - `buy` is a **dry run** unless `--confirm` is passed.
-- Toxic quotes are **never** routed. If every live issuer is toxic, `buy` refuses.
+- Toxic and suspect quotes are **never** routed. If every live issuer is toxic or suspect, `buy` refuses.
+- After a finished swap, the received amount is measured from the wallet balance; if it cannot be measured, the trade is logged as **not verified** rather than assumed.
 - A swap is reported as successful **only** after `baw market-order list` shows `FINISHED`; an `orderId` alone is treated as "submitted".
 - No API keys, private keys or wallet secrets are read or stored by TriQuote. Wallet authentication is handled entirely by the `baw` CLI.
 
@@ -257,7 +281,7 @@ We prefer to state these plainly:
 
 - **Runs locally.** Quoting and execution go through the `baw` CLI, which needs a signed-in Agentic Wallet session on the same machine. There is no hosted deployment.
 - **Quotes are indicative, not firm.** The executed price can differ from the quote within the slippage tolerance.
-- **The toxic threshold (300 bps) is a heuristic.** It is tuned to catch broken off-hours fills, not small premiums.
+- **The thresholds are heuristics.** 300 bps above and 500 bps below reference are tuned to catch broken off-hours routes, not ordinary premiums or weekend discounts.
 - **Off-hours reference.** When the US market is closed the reference is the *last* US price, so a genuine weekend move can look like a premium or discount.
 - **Two sources disagree on multipliers.** The registry reported `SPYx` multiplier `1`, while the dynamic endpoint reported `1.0057`. TriQuote prefers the dynamic value and falls back to the registry.
 - **Unknown issuer types ignored.** The registry also returned `type` values `4` and `9`, which are undocumented; TriQuote only routes types 1 (Ondo), 2 (xStocks) and 3 (bStocks).
@@ -266,7 +290,7 @@ We prefer to state these plainly:
 - **Live execution status:** see the execution log in the dashboard. If it is empty, no live swap has been run from this repository yet.
 - **Agent runs on testnet and locally.** The Agent Studio agent is registered on BSC testnet with a `localhost` endpoint; it was not deployed to a public runtime (the managed platform requires Bun and is a 48-hour testnet trial). Its quotes still come from BSC mainnet through `baw`.
 - **x402 rail not enabled.** B402 merchant credentials are issued only after manual approval, so the agent uses the ERC-8183 escrow rail instead.
-- **No completed paid job yet.** Negotiation (wallet-signed quote) and the work hook were verified live; an end-to-end funded ERC-8183 job was not completed because the testnet U faucet had hit its monthly limit.
+- **Paid job flow verified in parts.** Negotiation (wallet-signed quote) and the delivery work hook were verified live. A full funded ERC-8183 job additionally needs a separate buyer wallet holding the escrow's test asset; that end-to-end run is not included here.
 
 ## License
 

@@ -48,6 +48,16 @@ export async function walletStatus() {
   return runBaw(["wallet", "status"]);
 }
 
+export async function tokenBalance(tokenAddress) {
+  const result = await runBaw(["wallet", "balance", "--tokenAddress", tokenAddress, "--binanceChainId", BSC_BINANCE_CHAIN_ID]);
+  if (!result.success) {
+    return { success: false, balance: null, error: result.error ?? null };
+  }
+  const rows = Array.isArray(result.data) ? result.data : [];
+  const row = rows.find((item) => String(item.address ?? "").toLowerCase() === tokenAddress.toLowerCase());
+  return { success: true, balance: row ? Number(row.balance) : 0 };
+}
+
 export async function quoteSwap({ fromToken, toToken, fromTokenQty, slippage }) {
   const args = [
     "market-order", "quote",
