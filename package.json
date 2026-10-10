@@ -1,6 +1,6 @@
 {
   "name": "triquote",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Best-execution router and cross-issuer spread radar for tokenized stocks on BNB Smart Chain (bStocks, Ondo, xStocks) powered by Binance Agentic Wallet",
   "type": "module",
   "bin": {
@@ -10,7 +10,9 @@
     "scan": "node src/cli.js scan",
     "best": "node src/cli.js best",
     "buy": "node src/cli.js buy",
-    "dashboard": "node src/server.js"
+    "dashboard": "node src/server.js",
+    "replay": "node src/server.js --replay snapshots/scan-2026-10-10.json",
+    "test": "node --test"
   },
   "engines": {
     "node": ">=20"

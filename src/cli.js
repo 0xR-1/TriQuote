@@ -2,7 +2,7 @@
 import { appendFile, mkdir, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { quoteTicker, scan, TOXIC_PREMIUM_BPS, SUSPECT_DISCOUNT_BPS } from "./router.js";
+import { quoteTicker, scan, TOXIC_PREMIUM_BPS, SUSPECT_DISCOUNT_BPS, PEER_OUTLIER_BPS, MULTIPLIER_MISMATCH_BPS } from "./router.js";
 import { submitSwap, tokenBalance, waitForTerminalOrder, walletStatus } from "./baw.js";
 import { USDT_BSC } from "./registry.js";
 
@@ -72,16 +72,21 @@ function printTickerSummary(summary) {
       continue;
     }
     const core = `${label} ${usd(quote.pricePerShare, 4).padStart(12)} /share  ${signedBps(quote.premiumBps).padStart(11)} vs ref   x${quote.multiplier.toFixed(6)}   ${quote.latencyMs}ms`;
+    const why = quote.reasons?.length ? ` [${quote.reasons.join(", ")}]` : "";
     if (quote.toxic) {
       const loss = summary.best ? summary.usdtAmount * (1 - quote.sharesOut / summary.best.sharesOut) : null;
-      console.log(color.red(`  ☠ ${core}   TOXIC${loss !== null ? ` · would lose ${usd(loss, 2)}` : ""}`));
+      console.log(color.red(`  ☠ ${core}   TOXIC${loss !== null ? ` · would lose ${usd(loss, 2)}` : ""}${why}`));
       continue;
     }
     if (quote.suspect) {
-      console.log(color.yellow(`  ⚠ ${core}   SUSPECT · too cheap vs reference, not routed`));
+      console.log(color.yellow(`  ⚠ ${core}   SUSPECT · too cheap vs reference, not routed${why}`));
       continue;
     }
-    console.log(isBest ? color.green(`  ★ ${core}`) : `  · ${core}`);
+    if (quote.caution && !isBest) {
+      console.log(color.yellow(`  ? ${core}   CAUTION · not routed without --allow-caution${why}`));
+      continue;
+    }
+    console.log(isBest ? color.green(`  ★ ${core}${why}`) : `  · ${core}`);
   }
   if (summary.spreadBps !== null) {
     console.log(`  spread ${color.yellow(bps(summary.spreadBps))} between safe issuers · best vs worst saves ${color.green(usd(summary.savingsUsd, 4))}`);
@@ -91,6 +96,9 @@ function printTickerSummary(summary) {
   }
   if (summary.maxLossAvoidedUsd !== null) {
     console.log(color.red(`  blocked ${summary.toxic.length} toxic quote(s) priced >${TOXIC_PREMIUM_BPS} bps over reference · avoided losing up to ${usd(summary.maxLossAvoidedUsd, 2)}`));
+  }
+  if (summary.caution?.length > 0 && !summary.allowCaution) {
+    console.log(color.yellow(`  ${summary.caution.length} quote(s) carry one warning signal and were left out; pass --allow-caution to include them`));
   }
   if (summary.suspect?.length > 0) {
     console.log(color.yellow(`  held back ${summary.suspect.length} suspect quote(s) priced >${SUSPECT_DISCOUNT_BPS} bps under reference (likely bad data, not a bargain)`));
@@ -103,7 +111,8 @@ function printTickerSummary(summary) {
 function flagLabel(row) {
   const toxic = (row.toxic ?? []).map((quote) => `☠ ${quote.symbol}`);
   const suspect = (row.suspect ?? []).map((quote) => `⚠ ${quote.symbol}`);
-  const labels = [...toxic, ...suspect];
+  const caution = (row.caution ?? []).map((quote) => `? ${quote.symbol}`);
+  const labels = [...toxic, ...suspect, ...caution];
   return labels.length > 0 ? labels.join(" ") : "-";
 }
 
@@ -115,7 +124,7 @@ function printScanTable(rows) {
     const line = `${row.ticker.padEnd(7)} ${safe.padEnd(5)} ${best.padEnd(20)} ${usd(row.best?.pricePerShare, 4).padStart(13)}  ${signedBps(row.bestVsReferenceBps).padStart(9)}  ${bps(row.spreadBps).padStart(10)}   ${flagLabel(row)}`;
     if ((row.toxic?.length ?? 0) > 0) {
       console.log(color.red(line));
-    } else if ((row.suspect?.length ?? 0) > 0 || (row.spreadBps !== null && row.spreadBps >= 30)) {
+    } else if ((row.suspect?.length ?? 0) > 0 || (row.caution?.length ?? 0) > 0 || (row.spreadBps !== null && row.spreadBps >= 30)) {
       console.log(color.yellow(line));
     } else {
       console.log(line);
@@ -123,8 +132,9 @@ function printScanTable(rows) {
   }
   const toxicTotal = rows.reduce((total, row) => total + (row.toxic?.length ?? 0), 0);
   const suspectTotal = rows.reduce((total, row) => total + (row.suspect?.length ?? 0), 0);
-  if (toxicTotal > 0 || suspectTotal > 0) {
-    console.log(color.red(`\n${toxicTotal} toxic and ${suspectTotal} suspect quote(s) kept out of routing across ${rows.length} tickers`));
+  const cautionTotal = rows.reduce((total, row) => total + (row.caution?.length ?? 0), 0);
+  if (toxicTotal > 0 || suspectTotal > 0 || cautionTotal > 0) {
+    console.log(color.red(`\n${toxicTotal} toxic, ${suspectTotal} suspect and ${cautionTotal} caution quote(s) kept out of routing across ${rows.length} tickers`));
   }
 }
 
@@ -135,6 +145,8 @@ export function buildScanPayload(rows, usdtAmount, startedAt) {
     usdtAmount,
     toxicThresholdBps: TOXIC_PREMIUM_BPS,
     suspectThresholdBps: SUSPECT_DISCOUNT_BPS,
+    peerOutlierBps: PEER_OUTLIER_BPS,
+    multiplierMismatchBps: MULTIPLIER_MISMATCH_BPS,
     rows
   };
 }
@@ -146,6 +158,7 @@ async function commandScan(positional, flags) {
     tickers: positional,
     all: Boolean(flags.all),
     usdtAmount,
+    allowCaution: Boolean(flags["allow-caution"]),
     onProgress: ({ completed, total, row }) => {
       if (!flags.json) {
         process.stderr.write(color.dim(`  [${completed}/${total}] ${row.ticker}\n`));
@@ -170,7 +183,7 @@ async function commandBest(positional, flags) {
   if (!ticker) {
     throw new Error("Usage: node src/cli.js best <TICKER> [--usdt 5]");
   }
-  const summary = await quoteTicker(ticker, Number(flags.usdt ?? 5));
+  const summary = await quoteTicker(ticker, Number(flags.usdt ?? 5), { allowCaution: Boolean(flags["allow-caution"]) });
   if (flags.json) {
     console.log(JSON.stringify(summary, null, 2));
     return;
@@ -218,11 +231,11 @@ async function commandBuy(positional, flags) {
   if (!status.success || status.data?.status !== "CONNECTED") {
     throw new Error("Agentic Wallet is not connected. Run: baw auth signin --json");
   }
-  const summary = await quoteTicker(ticker, usdtAmount);
+  const summary = await quoteTicker(ticker, usdtAmount, { allowCaution: Boolean(flags["allow-caution"]) });
   printTickerSummary(summary);
   if (!summary.best) {
-    const flagged = (summary.toxic?.length ?? 0) + (summary.suspect?.length ?? 0);
-    const reason = flagged > 0 ? "every live quote is toxic or suspect" : "no issuer has live liquidity";
+    const flagged = (summary.toxic?.length ?? 0) + (summary.suspect?.length ?? 0) + (summary.caution?.length ?? 0);
+    const reason = flagged > 0 ? "every live quote is toxic, suspect or caution" : "no issuer has live liquidity";
     throw new Error(`Refusing to route ${summary.ticker}: ${reason} right now`);
   }
   const route = summary.best;
@@ -265,6 +278,8 @@ async function commandBuy(positional, flags) {
     savingsUsd: summary.savingsUsd,
     toxicBlocked: summary.toxic.map((quote) => quote.symbol),
     suspectHeld: (summary.suspect ?? []).map((quote) => quote.symbol),
+    routeGrade: route.grade,
+    routeReasons: route.reasons ?? [],
     lossAvoidedUsd: summary.maxLossAvoidedUsd,
     fillVerified: fill.verified,
     receivedTokens: fill.receivedTokens ?? null,
@@ -298,7 +313,7 @@ async function main() {
   const [commandName, ...rest] = process.argv.slice(2);
   const command = COMMANDS[commandName];
   if (!command) {
-    console.log("Usage:\n  node src/cli.js scan [TICKERS...] [--all] [--usdt 5] [--json] [--save snapshots/scan.json]\n  node src/cli.js best <TICKER> [--usdt 5] [--json]\n  node src/cli.js buy <TICKER> --usdt <amount<=5> [--confirm] [--slippage 1]");
+    console.log("Usage:\n  node src/cli.js scan [TICKERS...] [--all] [--usdt 5] [--allow-caution] [--json] [--save snapshots/scan.json]\n  node src/cli.js best <TICKER> [--usdt 5] [--allow-caution] [--json]\n  node src/cli.js buy <TICKER> --usdt <amount<=5> [--allow-caution] [--confirm] [--slippage 1]");
     process.exitCode = commandName ? 1 : 0;
     return;
   }

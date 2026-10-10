@@ -24,6 +24,8 @@ All numbers below were produced by TriQuote against BSC mainnet for a 5 USDT ord
 |---|---|
 | **Toxic quote returned as success** | `SPYx` quoted at **$8,912 / share** vs a US reference of **$779.87**. Routing there would lose **$4.57 of $5 (91%)**. `baw market-order quote` returned `success: true` with no warning. TriQuote flagged and blocked it. |
 | **It is a mispriced route, not a units bug** | Re-quoting `SPYx` at 0.5, 5 and 50 USDT gave **$8,944, $8,964 and $9,161 per token** — about **11.5× the reference at every size**. A decimals error would be an exact power of ten; thin depth would start near the reference and climb. Instead the route itself is priced ~11.5× off from the first cent. |
+| **Four independent red flags on one quote** | TriQuote's grader marks that `SPYx` route `TOXIC` for `REF_PREMIUM`, `ORACLE_DEVIATION`, `PEER_OUTLIER` and `MULTIPLIER_MISMATCH` at the same time. Across the 10-ticker watchlist it is the only quote that fails any check. |
+| **xStocks registry multipliers are stale** | For 8 of 10 xStocks tokens the registry multiplier (`1`) disagrees with the dynamic endpoint by up to **57 bps**. For every Ondo and bStocks token the two sources agree exactly. |
 | **Multiplier flips the winner** | On SPY, META, QQQ and AAPL the issuer that returns the most *tokens* is **not** the issuer that returns the most *shares*. |
 | **Off-hours discount** | Best safe SPY route (`SPYon`) filled **74 bps below** the last US price. |
 | **Fragmented coverage** | Binance's registry lists **40 tickers on all three issuers** and **121 on at least two** on BSC. |
@@ -35,8 +37,11 @@ All numbers below were produced by TriQuote against BSC mainnet for a 5 USDT ord
 - **Cross-issuer radar** — scans a watchlist (or every multi-issuer ticker) and ranks by spread.
 - **Per-share normalization** — `pricePerShare = usdtIn / (tokensOut × multiplier)`, using the live multiplier from Binance.
 - **Reference price** — US last price from Binance's tokenized-securities API, falling back to the median oracle price per share.
-- **Toxic-quote shield** — any quote more than **300 bps** above reference is excluded from routing and reported with the loss it would have caused.
-- **Suspect-data guard** — any quote more than **500 bps** *below* reference is held back as likely bad data (wrong multiplier, broken pool) instead of being crowned the cheapest route.
+- **Multi-signal grading** — every quote is checked against three independent prices (US last price, on-chain oracle median, median of all issuers) plus agreement between Binance's two multiplier sources. Each quote gets a grade and the reasons behind it:
+  - `SAFE` — no warning, routable.
+  - `CAUTION` — exactly one warning; left out unless `--allow-caution` is passed.
+  - `TOXIC` — two or more warnings, or one deviation above 2,000 bps, and overpriced; never routed, and the loss it would have caused is reported.
+  - `SUSPECT` — same bar but implausibly cheap (likely bad data, not a bargain); never routed.
 - **Best-route execution** — buys the cheapest safe issuer via `baw market-order swap`, hard-capped at **5 USDT**, dry-run by default, and only reported as done once the order reaches `FINISHED`.
 - **Fill verification** — after a swap finishes, TriQuote measures the tokens actually received (wallet balance before vs after) and logs the real price per share against both the quote and the reference.
 - **Replay mode** — `scan --save` records a live scan; the dashboard can replay it with no wallet, so anyone can inspect real results.
@@ -78,11 +83,11 @@ flowchart TD
 
     subgraph Route["router.js"]
         RT[Normalize per share] --> P[Premium vs reference]
-        P --> T{More than 300 bps<br/>above reference?}
-        T -->|yes| X[☠ Toxic<br/>blocked]
-        T -->|no| D{More than 500 bps<br/>below reference?}
-        D -->|yes| SU[⚠ Suspect<br/>held back]
-        D -->|no| S[✓ Safe]
+        P --> G{Grade: reference · oracle ·<br/>issuer median · multiplier check}
+        G -->|2+ warnings, overpriced| X[☠ TOXIC<br/>blocked]
+        G -->|2+ warnings, too cheap| SU[⚠ SUSPECT<br/>held back]
+        G -->|1 warning| C[? CAUTION<br/>opt-in only]
+        G -->|no warning| S[✓ SAFE]
         S --> B[★ Rank by shares out<br/>pick best]
     end
 
@@ -99,7 +104,7 @@ flowchart TD
     classDef wallet fill:#f0b90b,stroke:#f0b90b,color:#111
     classDef suspect fill:#ffb547,stroke:#ffb547,color:#2a1a00
     class X toxic
-    class SU suspect
+    class SU,C suspect
     class B,OK best
     class Q,SW wallet
 ```
@@ -109,10 +114,11 @@ flowchart TD
 | `src/registry.js` | Fetches and caches the tokenized-stock registry, groups BSC listings by ticker |
 | `src/baw.js` | Thin wrapper over the `baw` CLI with latency measurement and order polling |
 | `src/reference.js` | Reference price, live multipliers and market status per issuer |
-| `src/router.js` | Quotes all issuers in parallel, normalizes, flags toxic quotes, ranks routes |
+| `src/router.js` | Quotes all issuers in parallel, normalizes, grades each quote with reasons, ranks routes (pure `assessQuotes` / `summarizeRoutes`) |
 | `src/cli.js` | `scan`, `best`, `buy` commands |
 | `src/server.js` | Local HTTP API + dashboard server, with `--replay` for recorded scans |
 | `snapshots/` | Recorded live scans for replay |
+| `test/router.test.js` | `node --test` suite built on the live 10 Oct 2026 SPY quotes |
 | `public/index.html` | Dashboard UI (no external dependencies) |
 
 ## TriQuote as an agent (BNB Agent Studio)
@@ -164,7 +170,7 @@ Example deliverable (live, 10 Oct 2026):
   "bestRoute": { "issuer": "Ondo", "symbol": "SPYon", "pricePerShare": 774.2867, "premiumVsReferenceBps": -74 },
   "routes": [
     { "issuer": "Ondo", "symbol": "SPYon", "status": "best", "pricePerShare": 774.2867, "premiumVsReferenceBps": -74 },
-    { "issuer": "xStocks", "symbol": "SPYx", "status": "toxic", "pricePerShare": 8912.2702, "premiumVsReferenceBps": 104249, "lossIfRoutedUsd": 4.5656 },
+    { "issuer": "xStocks", "symbol": "SPYx", "status": "toxic", "reasons": ["REF_PREMIUM", "ORACLE_DEVIATION", "PEER_OUTLIER", "MULTIPLIER_MISMATCH"], "pricePerShare": 8912.2702, "premiumVsReferenceBps": 104249, "lossIfRoutedUsd": 4.5656 },
     { "issuer": "bStocks", "symbol": "SPYB", "status": "safe", "pricePerShare": 778.0066, "premiumVsReferenceBps": -27 }
   ],
   "toxicBlocked": ["SPYx"],
@@ -237,6 +243,7 @@ node src/cli.js scan
 node src/cli.js scan NVDA TSLA AAPL --usdt 5
 node src/cli.js scan --all
 node src/cli.js scan --save snapshots/my-scan.json
+node src/cli.js best SPY --allow-caution
 node src/cli.js buy NVDA --usdt 5
 node src/cli.js buy NVDA --usdt 5 --confirm
 ```
@@ -249,13 +256,21 @@ Example output (`best SPY`, 10 Oct 2026):
 SPY  ·  5 USDT  ·  2 safe / 3 live / 3 listed
   ref $779.87 (US last price) · market offhours
   ★ Ondo     SPYon         $774.0884 /share      -74 bps vs ref   x1.009473   3835ms
-  ☠ xStocks  SPYx         $8912.3343 /share  +104280 bps vs ref   x1.005715   3191ms   TOXIC · would lose $4.57
+  ☠ xStocks  SPYx         $8912.3343 /share  +104280 bps vs ref   x1.005715   3191ms   TOXIC · would lose $4.57 [REF_PREMIUM, ORACLE_DEVIATION, PEER_OUTLIER, MULTIPLIER_MISMATCH]
   · bStocks  SPYB          $777.8106 /share      -26 bps vs ref   x1.001730   3179ms
   spread 48.1 bps between safe issuers · best vs worst saves $0.0239
   best route is 74 bps BELOW the reference price
   blocked 1 toxic quote(s) priced >300 bps over reference · avoided losing up to $4.57
   ! raw token amounts point to a different issuer; share multipliers change the winner
 ```
+
+### Tests
+
+```bash
+npm test
+```
+
+Eight `node --test` cases, no dependencies and no network: the live SPY quotes from 10 Oct 2026 (SPYx graded TOXIC for all four reasons, $4.57 loss avoided), the multiplier flipping the winner, a suspiciously cheap quote being held back, CAUTION being opt-in, the issuer-median signal abstaining when only two issuers are live, and unavailable issuers never being routed.
 
 ### Dashboard
 
@@ -270,7 +285,7 @@ Open <http://localhost:4173>. A live scan of 10 tickers takes roughly 15–30 se
 
 - Every live trade is capped at **5 USDT** in code.
 - `buy` is a **dry run** unless `--confirm` is passed.
-- Toxic and suspect quotes are **never** routed. If every live issuer is toxic or suspect, `buy` refuses.
+- Only `SAFE` quotes are routed by default; `CAUTION` needs `--allow-caution`; `TOXIC` and `SUSPECT` are **never** routed. If nothing routable is left, `buy` refuses.
 - After a finished swap, the received amount is measured from the wallet balance; if it cannot be measured, the trade is logged as **not verified** rather than assumed.
 - A swap is reported as successful **only** after `baw market-order list` shows `FINISHED`; an `orderId` alone is treated as "submitted".
 - No API keys, private keys or wallet secrets are read or stored by TriQuote. Wallet authentication is handled entirely by the `baw` CLI.
@@ -281,9 +296,10 @@ We prefer to state these plainly:
 
 - **Runs locally.** Quoting and execution go through the `baw` CLI, which needs a signed-in Agentic Wallet session on the same machine. There is no hosted deployment.
 - **Quotes are indicative, not firm.** The executed price can differ from the quote within the slippage tolerance.
-- **The thresholds are heuristics.** 300 bps above and 500 bps below reference are tuned to catch broken off-hours routes, not ordinary premiums or weekend discounts.
+- **The thresholds are heuristics.** 300 bps vs reference/oracle, 500 bps vs the issuer median, 50 bps of multiplier disagreement and 2,000 bps "extreme" are tuned to catch broken off-hours routes, not ordinary premiums or weekend discounts. They are not yet tightened for market hours.
+- **The issuer-median signal needs three live issuers.** With only two, a median cannot tell which one is wrong, so that signal abstains and grading relies on the reference, the oracle and the multiplier check.
 - **Off-hours reference.** When the US market is closed the reference is the *last* US price, so a genuine weekend move can look like a premium or discount.
-- **Two sources disagree on multipliers.** The registry reported `SPYx` multiplier `1`, while the dynamic endpoint reported `1.0057`. TriQuote prefers the dynamic value and falls back to the registry.
+- **Two sources disagree on multipliers.** For xStocks the registry and the dynamic endpoint differ by up to 57 bps. TriQuote prices with the dynamic value and raises `MULTIPLIER_MISMATCH` when they disagree by more than 50 bps.
 - **Unknown issuer types ignored.** The registry also returned `type` values `4` and `9`, which are undocumented; TriQuote only routes types 1 (Ondo), 2 (xStocks) and 3 (bStocks).
 - **Buy only.** There is no sell or rebalance route yet.
 - **Latency.** Each quote takes ~1.7–3.8 s; a full `--all` scan quotes hundreds of routes and is slow.
@@ -291,6 +307,12 @@ We prefer to state these plainly:
 - **Agent runs on testnet and locally.** The Agent Studio agent is registered on BSC testnet with a `localhost` endpoint; it was not deployed to a public runtime (the managed platform requires Bun and is a 48-hour testnet trial). Its quotes still come from BSC mainnet through `baw`.
 - **x402 rail not enabled.** B402 merchant credentials are issued only after manual approval, so the agent uses the ERC-8183 escrow rail instead.
 - **Paid job flow verified in parts.** Negotiation (wallet-signed quote) and the delivery work hook were verified live. A full funded ERC-8183 job additionally needs a separate buyer wallet holding the escrow's test asset; that end-to-end run is not included here.
+
+## Next steps
+
+- **Size-aware routing:** quote each issuer at several order sizes and route on the effective price at the actual order size, since the best issuer at 5 USDT is not always the best at 100.
+- **Contract-level issuer risk:** read pause, blacklist, owner and upgradeability state for each token contract and show it next to the price, without mixing it into the price grade.
+- **Market-hours thresholds:** tighten the reference and oracle bands while the US market is open.
 
 ## License
 

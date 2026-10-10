@@ -98,9 +98,13 @@ function summarizeQuote(quote: Record<string, any>, best: Record<string, any> | 
   if (!quote.available) {
     return { ...base, status: "unavailable", reason: quote.error };
   }
+  const isBest = Boolean(best && best.issuer === quote.issuer);
+  const status = quote.toxic ? "toxic" : quote.suspect ? "suspect" : isBest ? "best" : quote.caution ? "caution" : "safe";
   const summary: Record<string, unknown> = {
     ...base,
-    status: quote.toxic ? "toxic" : best && best.issuer === quote.issuer ? "best" : "safe",
+    status,
+    grade: quote.grade ?? null,
+    reasons: quote.reasons ?? [],
     pricePerShare: roundOrNull(quote.pricePerShare, 4),
     premiumVsReferenceBps: roundOrNull(quote.premiumBps, 0),
     sharesOut: quote.sharesOut,
@@ -134,6 +138,8 @@ export function buildTriQuoteReport(summary: Record<string, any>): Record<string
     routes: (summary.quotes ?? []).map((quote: Record<string, any>) => summarizeQuote(quote, best, usdt)),
     safeSpreadBps: roundOrNull(summary.spreadBps, 1),
     toxicBlocked: (summary.toxic ?? []).map((quote: Record<string, any>) => quote.symbol),
+    suspectHeld: (summary.suspect ?? []).map((quote: Record<string, any>) => quote.symbol),
+    cautionHeld: (summary.caution ?? []).map((quote: Record<string, any>) => quote.symbol),
     maxLossAvoidedUsd: roundOrNull(summary.maxLossAvoidedUsd, 4),
     multiplierFlipsWinner: Boolean(summary.multiplierFlipsWinner),
     executeWith: best

@@ -69,6 +69,9 @@ tr:last-child td { border-bottom: 0; }
 .cell.suspect { background: rgba(255, 181, 71, 0.12); border-color: rgba(255, 181, 71, 0.35); }
 .cell.suspect .price { color: var(--amber); }
 .cell.suspect .tag { background: var(--amber); color: #2a1a00; }
+.cell.caution { background: rgba(120, 160, 255, 0.10); border-color: rgba(120, 160, 255, 0.35); }
+.cell.caution .tag { background: #7aa0ff; color: #06142e; }
+.reasons { font-size: 10px; letter-spacing: 0.4px; color: var(--muted); margin-top: 4px; font-family: var(--mono); }
 .cell.na { color: var(--muted); }
 .cell.na .tag { background: transparent; border: 1px dashed var(--line); color: var(--muted); }
 .neg { color: var(--green); }
@@ -100,7 +103,7 @@ footer { color: var(--muted); font-size: 12px; text-align: center; margin-top: 2
 
   <section class="kpis">
     <div class="kpi"><div class="label">Tickers scanned</div><div class="value" id="kTickers">-</div></div>
-    <div class="kpi"><div class="label">Toxic / suspect blocked</div><div class="value red" id="kToxic">-</div></div>
+    <div class="kpi"><div class="label">Toxic / suspect / caution</div><div class="value red" id="kToxic">-</div></div>
     <div class="kpi"><div class="label">Max loss avoided</div><div class="value red" id="kLoss">-</div></div>
     <div class="kpi"><div class="label">Widest safe spread</div><div class="value amber" id="kSpread">-</div></div>
     <div class="kpi"><div class="label">Best discount vs ref</div><div class="value green" id="kDiscount">-</div></div>
@@ -155,7 +158,7 @@ footer { color: var(--muted); font-size: 12px; text-align: center; margin-top: 2
     <div class="how">
       <div><b>1 · Resolve</b>Every ticker is mapped to its bStocks, Ondo and xStocks contracts on BSC from Binance's tokenized-securities registry.</div>
       <div><b>2 · Quote &amp; normalize</b>Each issuer is quoted for the same USDT amount via <code>baw market-order quote</code>, then divided by its live share multiplier so prices are compared per real share.</div>
-      <div><b>3 · Shield</b>Each fill is checked against the US last price (or the oracle median when the US price is missing). Anything more than <span id="threshold">300</span> bps above reference is flagged toxic, and anything more than <span id="suspectThreshold">500</span> bps below it is held back as suspect data. Neither is ever routed.</div>
+      <div><b>3 · Shield</b>Each quote is graded against three independent signals — the US last price, the on-chain oracle median and the median of all issuers — plus a check that Binance's two multiplier sources agree. One warning makes it CAUTION; two, or one extreme (&gt;2000 bps) deviation, make it TOXIC (overpriced) or SUSPECT (implausibly cheap). Only SAFE quotes are routed by default. Thresholds: <span id="threshold">300</span> bps above reference, <span id="suspectThreshold">500</span> bps below.</div>
       <div><b>4 · Execute</b>The cheapest safe route is executed with <code>baw market-order swap</code>, only reported as done after the order reaches <code>FINISHED</code>, then verified by measuring the tokens actually received.</div>
     </div>
   </section>
@@ -180,15 +183,19 @@ function renderCell(row, issuer) {
     return `<div class="cell na" title="${escapeHtml(quote.error)}"><div class="price">${escapeHtml(quote.symbol)}</div><span class="tag">NO LIQUIDITY</span></div>`;
   }
   const premium = `<div class="sub ${bpsClass(quote.premiumBps)}">${signedBps(quote.premiumBps)} vs ref</div>`;
+  const reasons = quote.reasons?.length ? `<div class="reasons">${quote.reasons.map(escapeHtml).join(" · ")}</div>` : "";
   if (quote.toxic) {
     const loss = row.best ? row.usdtAmount * (1 - quote.sharesOut / row.best.sharesOut) : null;
-    return `<div class="cell toxic"><div class="price">${money(quote.pricePerShare)}</div>${premium}<span class="tag">☠ TOXIC${loss !== null ? " · −" + money(loss) : ""}</span></div>`;
+    return `<div class="cell toxic"><div class="price">${money(quote.pricePerShare)}</div>${premium}<span class="tag">☠ TOXIC${loss !== null ? " · −" + money(loss) : ""}</span>${reasons}</div>`;
   }
   if (quote.suspect) {
-    return `<div class="cell suspect"><div class="price">${money(quote.pricePerShare)}</div><div class="sub pos">${signedBps(quote.premiumBps)} vs ref</div><span class="tag">⚠ SUSPECT</span></div>`;
+    return `<div class="cell suspect"><div class="price">${money(quote.pricePerShare)}</div><div class="sub pos">${signedBps(quote.premiumBps)} vs ref</div><span class="tag">⚠ SUSPECT</span>${reasons}</div>`;
   }
   const isBest = row.best && row.best.issuer === issuer;
-  return `<div class="cell ${isBest ? "best" : "safe"}"><div class="price">${money(quote.pricePerShare)}</div>${premium}<span class="tag">${isBest ? "★ BEST" : escapeHtml(quote.symbol)}</span></div>`;
+  if (quote.caution && !isBest) {
+    return `<div class="cell caution"><div class="price">${money(quote.pricePerShare)}</div>${premium}<span class="tag">? CAUTION</span>${reasons}</div>`;
+  }
+  return `<div class="cell ${isBest ? "best" : "safe"}"><div class="price">${money(quote.pricePerShare)}</div>${premium}<span class="tag">${isBest ? "★ BEST" : escapeHtml(quote.symbol)}</span>${reasons}</div>`;
 }
 
 function renderRadar(payload) {
@@ -216,11 +223,12 @@ function renderKpis(payload) {
   const rows = payload.rows;
   const toxicCount = rows.reduce((total, row) => total + (row.toxic?.length ?? 0), 0);
   const suspectCount = rows.reduce((total, row) => total + (row.suspect?.length ?? 0), 0);
+  const cautionCount = rows.reduce((total, row) => total + (row.caution?.length ?? 0), 0);
   const maxLoss = Math.max(0, ...rows.map((row) => row.maxLossAvoidedUsd ?? 0));
   const widest = rows.filter((row) => row.spreadBps != null).sort((a, b) => b.spreadBps - a.spreadBps)[0];
   const discount = rows.filter((row) => row.bestVsReferenceBps != null && row.bestVsReferenceBps < 0).sort((a, b) => a.bestVsReferenceBps - b.bestVsReferenceBps)[0];
   $("kTickers").textContent = rows.length;
-  $("kToxic").textContent = `${toxicCount} / ${suspectCount}`;
+  $("kToxic").textContent = `${toxicCount} / ${suspectCount} / ${cautionCount}`;
   $("kLoss").textContent = maxLoss > 0 ? money(maxLoss) + " / " + money(payload.usdtAmount, 0) : "$0";
   $("kSpread").textContent = widest ? `${widest.spreadBps.toFixed(0)} bps ${widest.ticker}` : "-";
   $("kDiscount").textContent = discount ? `${Math.abs(discount.bestVsReferenceBps).toFixed(0)} bps ${discount.ticker}` : "-";
