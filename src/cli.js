@@ -7,6 +7,8 @@ import { submitSwap, tokenBalance, waitForTerminalOrder, walletStatus } from "./
 import { USDT_BSC } from "./registry.js";
 
 const MAX_TRADE_USDT = 5;
+export const DEFAULT_SLIPPAGE_PERCENT = 1;
+export const MAX_SLIPPAGE_PERCENT = 5;
 const BALANCE_POLL_ATTEMPTS = 6;
 const BALANCE_POLL_INTERVAL_MS = 3000;
 const PROJECT_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -218,6 +220,17 @@ async function measureFill(route, usdtAmount, balanceBefore, referencePrice) {
   return { verified: false, reason: "token balance did not increase within the polling window" };
 }
 
+export function resolveSlippage(value) {
+  if (value === undefined || value === true) {
+    return DEFAULT_SLIPPAGE_PERCENT;
+  }
+  const percent = Number(value);
+  if (!Number.isFinite(percent) || percent <= 0 || percent > MAX_SLIPPAGE_PERCENT) {
+    throw new Error(`--slippage must be a percentage above 0 and at most ${MAX_SLIPPAGE_PERCENT}`);
+  }
+  return percent;
+}
+
 async function commandBuy(positional, flags) {
   const ticker = positional[0];
   const usdtAmount = Number(flags.usdt);
@@ -227,6 +240,7 @@ async function commandBuy(positional, flags) {
   if (usdtAmount > MAX_TRADE_USDT) {
     throw new Error(`Refusing to trade ${usdtAmount} USDT: TriQuote caps every live trade at ${MAX_TRADE_USDT} USDT`);
   }
+  const slippage = resolveSlippage(flags.slippage);
   const status = await walletStatus();
   if (!status.success || status.data?.status !== "CONNECTED") {
     throw new Error("Agentic Wallet is not connected. Run: baw auth signin --json");
@@ -239,7 +253,7 @@ async function commandBuy(positional, flags) {
     throw new Error(`Refusing to route ${summary.ticker}: ${reason} right now`);
   }
   const route = summary.best;
-  console.log(color.bold(`\nRoute: ${usdtAmount} USDT → ${route.symbol} (${route.issuerName}) at ~${usd(route.pricePerShare, 4)}/share (${signedBps(route.premiumBps)} vs ref)`));
+  console.log(color.bold(`\nRoute: ${usdtAmount} USDT → ${route.symbol} (${route.issuerName}) at ~${usd(route.pricePerShare, 4)}/share (${signedBps(route.premiumBps)} vs ref) · max slippage ${slippage}%`));
   if (!flags.confirm) {
     console.log(color.yellow("Dry run only. Re-run with --confirm to execute this swap on BSC mainnet."));
     return;
@@ -250,7 +264,7 @@ async function commandBuy(positional, flags) {
     fromToken: USDT_BSC,
     toToken: route.address,
     fromTokenQty: usdtAmount,
-    slippage: flags.slippage
+    slippage
   });
   if (!submitted.success || !submitted.data?.orderId) {
     await logTrade({ at: new Date().toISOString(), ticker: summary.ticker, usdtAmount, route: route.symbol, issuer: route.issuer, status: "REJECTED", error: submitted.error ?? null });
@@ -274,6 +288,7 @@ async function commandBuy(positional, flags) {
     quotedPricePerShare: route.pricePerShare,
     referencePrice: summary.reference?.price ?? null,
     premiumBps: route.premiumBps,
+    slippagePercent: slippage,
     spreadBps: summary.spreadBps,
     savingsUsd: summary.savingsUsd,
     toxicBlocked: summary.toxic.map((quote) => quote.symbol),
