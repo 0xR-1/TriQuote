@@ -37,6 +37,7 @@ All numbers below were produced by TriQuote against BSC mainnet for a 5 USDT ord
 - **Toxic-quote shield** — any quote more than **300 bps** above reference is excluded from routing and reported with the loss it would have caused.
 - **Best-route execution** — buys the cheapest safe issuer via `baw market-order swap`, hard-capped at **5 USDT**, dry-run by default, and only reported as done once the order reaches `FINISHED`.
 - **Live dashboard** — local web UI with KPIs, per-issuer cells (★ BEST / ☠ TOXIC / NO LIQUIDITY) and an execution log.
+- **Agent-to-agent service** — a BNB Agent Studio seller agent (ERC-8004 identity **#2586**) that sells TriQuote route reports to other agents over A2A and MCP, paid through ERC-8183 escrow.
 
 ## Binance Web3 stack used
 
@@ -45,6 +46,7 @@ All numbers below were produced by TriQuote against BSC mainnet for a 5 USDT ord
 | **Agentic Wallet (`baw` CLI)** | `market-order quote` for every issuer, `market-order swap` for execution, `market-order list` to poll to a terminal state, `wallet status` before trading |
 | **Tokenized securities registry** | `.../rwa/stock/detail/list/ai` — maps each ticker to its bStocks / Ondo / xStocks contracts and multipliers on BSC |
 | **Tokenized securities dynamic data** | `.../rwa/dynamic/ai` — live share multiplier, oracle token price, US stock price and market status per token |
+| **BNB Agent Studio (`bag` CLI)** | Seller agent scaffold, ERC-8004 identity registration, ERC-8183 signed quotes and escrowed delivery, A2A + MCP faces |
 
 ## Architecture
 
@@ -73,18 +75,18 @@ flowchart TD
     subgraph Route["router.js"]
         RT[Normalize per share] --> P[Premium vs reference]
         P --> T{More than 300 bps<br/>above reference?}
-        T -- yes --> X[☠ Toxic<br/>blocked]
-        T -- no --> S[✓ Safe]
+        T -->|yes| X[☠ Toxic<br/>blocked]
+        T -->|no| S[✓ Safe]
         S --> B[★ Rank by shares out<br/>pick best]
     end
 
     B --> CLI[cli.js<br/>scan · best · buy]
     B --> SRV[server.js<br/>dashboard API]
     SRV --> UI[public/index.html<br/>live dashboard]
-    CLI -- buy --confirm --> SW[baw market-order swap<br/>max 5 USDT]
+    CLI -->|confirmed buy| SW[baw market-order swap<br/>max 5 USDT]
     SW --> PL{Poll order}
-    PL -- FINISHED --> OK([Done · BscScan tx])
-    PL -- FAILED --> KO([Reported as failed])
+    PL -->|FINISHED| OK([Done · BscScan tx])
+    PL -->|FAILED| KO([Reported as failed])
 
     classDef toxic fill:#ff5c6c,stroke:#ff5c6c,color:#fff
     classDef best fill:#2fd98b,stroke:#2fd98b,color:#062
@@ -103,6 +105,82 @@ flowchart TD
 | `src/cli.js` | `scan`, `best`, `buy` commands |
 | `src/server.js` | Local HTTP API + dashboard server |
 | `public/index.html` | Dashboard UI (no external dependencies) |
+
+## TriQuote as an agent (BNB Agent Studio)
+
+`triquoteagent/` is a BNB Agent Studio seller agent that turns TriQuote into a service other AI agents can discover, pay and call. Instead of an LLM, its work hook runs the TriQuote engine and returns a structured route report.
+
+| Item | Value |
+|---|---|
+| ERC-8004 identity | **Agent #2586** on BSC testnet, registry `eip155:97:0x8004A818BFB912233c491871b3d84c89A494BD9e` |
+| Agent wallet | `0xF2cb1E553a98705C0b00774DC4a3e015324115e5` |
+| Faces | A2A (`/.well-known/agent-card.json`) and MCP (`/mcp`) |
+| Commerce rail | ERC-8183 escrow on BSC testnet, **0.01 U per route report** |
+| Work hook | `triquoteagent/app/agent/src/triquoteWork.ts` → `src/router.js` |
+
+```mermaid
+sequenceDiagram
+    participant Buyer as Buyer agent
+    participant TQ as TriQuote agent 2586
+    participant Chain as BSC (ERC-8183 escrow)
+    participant Engine as TriQuote engine
+    participant AW as Agentic Wallet (baw)
+
+    Buyer->>TQ: negotiate (SPY, 5 USDT)
+    TQ-->>Buyer: wallet-signed quote (0.01 U)
+    Buyer->>Chain: createJob + fund
+    Buyer->>TQ: notify_funded job_id
+    TQ->>Chain: verify signed + funded job
+    TQ->>Engine: quoteTicker SPY 5
+    Engine->>AW: market-order quote for 3 issuers
+    Engine-->>TQ: best route, toxic quotes, spreads
+    TQ->>Chain: submit deliverable
+    Buyer->>Chain: read deliverable
+    Buyer->>AW: execute the returned swap command
+```
+
+The agent sells **route intelligence**, not execution: the report ends with the exact `baw market-order swap` command, so the buyer executes in its own Agentic Wallet and never hands over funds.
+
+Example deliverable (live, 10 Oct 2026):
+
+```json
+{
+  "service": "TriQuote best-execution route",
+  "ticker": "SPY",
+  "usdt": 5,
+  "reference": { "price": 780.075, "source": "us-stock-last", "marketStatus": "offhours" },
+  "verdict": "Route 5 USDT to SPYon (Ondo)",
+  "bestRoute": { "issuer": "Ondo", "symbol": "SPYon", "pricePerShare": 774.2867, "premiumVsReferenceBps": -74 },
+  "routes": [
+    { "issuer": "Ondo", "symbol": "SPYon", "status": "best", "pricePerShare": 774.2867, "premiumVsReferenceBps": -74 },
+    { "issuer": "xStocks", "symbol": "SPYx", "status": "toxic", "pricePerShare": 8912.2702, "premiumVsReferenceBps": 104249, "lossIfRoutedUsd": 4.5656 },
+    { "issuer": "bStocks", "symbol": "SPYB", "status": "safe", "pricePerShare": 778.0066, "premiumVsReferenceBps": -27 }
+  ],
+  "toxicBlocked": ["SPYx"],
+  "executeWith": "baw market-order swap --fromTokenQty 5 --fromToken 0x55d3...7955 --toToken 0x6a70...331a --binanceChainId 56 --json"
+}
+```
+
+### Run the agent
+
+Requires Node.js 22+, pnpm 10 and the Agent Studio CLI.
+
+```bash
+npm install -g @bnbagent/studio-cli
+cd triquoteagent
+pnpm install
+cd app/agent
+bag wallet new --generate-password
+bag doctor
+cd ../..
+bag dev
+```
+
+Ask the agent for a signed quote:
+
+```bash
+curl -s http://localhost:9000/ -H 'Content-Type: application/json' -d '{"jsonrpc":"2.0","id":1,"method":"message/send","params":{"message":{"kind":"message","messageId":"tq-1","role":"user","parts":[{"kind":"data","data":{"skill":"negotiate","task_description":"{\"ticker\":\"SPY\",\"usdt\":5}","terms":{"deliverables":"TriQuote route report","quality_standards":"All issuers quoted"}}}]}}}'
+```
 
 ## Run it
 
@@ -143,15 +221,20 @@ node src/cli.js buy NVDA --usdt 5 --confirm
 
 `buy` without `--confirm` is a dry run: it shows the route it *would* take and stops.
 
-Example output (`best SPY`, 10 Oct 2026):SPY · 5 USDT · 2 safe / 3 live / 3 listed
-ref $779.87 (US last price) · market offhours
-★ Ondo SPYon $774.0884 /share -74 bps vs ref x1.009473 3835ms
-☠ xStocks SPYx $8912.3343 /share +104280 bps vs ref x1.005715 3191ms TOXIC · would lose $4.57
-· bStocks SPYB $777.8106 /share -26 bps vs ref x1.001730 3179ms
-spread 48.1 bps between safe issuers · best vs worst saves $0.0239
-best route is 74 bps BELOW the reference price
-blocked 1 toxic quote(s) priced >300 bps over reference · avoided losing up to $4.57
-! raw token amounts point to a different issuer; share multipliers change the winner
+Example output (`best SPY`, 10 Oct 2026):
+
+```
+SPY  ·  5 USDT  ·  2 safe / 3 live / 3 listed
+  ref $779.87 (US last price) · market offhours
+  ★ Ondo     SPYon         $774.0884 /share      -74 bps vs ref   x1.009473   3835ms
+  ☠ xStocks  SPYx         $8912.3343 /share  +104280 bps vs ref   x1.005715   3191ms   TOXIC · would lose $4.57
+  · bStocks  SPYB          $777.8106 /share      -26 bps vs ref   x1.001730   3179ms
+  spread 48.1 bps between safe issuers · best vs worst saves $0.0239
+  best route is 74 bps BELOW the reference price
+  blocked 1 toxic quote(s) priced >300 bps over reference · avoided losing up to $4.57
+  ! raw token amounts point to a different issuer; share multipliers change the winner
+```
+
 ### Dashboard
 
 ```bash
@@ -181,6 +264,9 @@ We prefer to state these plainly:
 - **Buy only.** There is no sell or rebalance route yet.
 - **Latency.** Each quote takes ~1.7–3.8 s; a full `--all` scan quotes hundreds of routes and is slow.
 - **Live execution status:** see the execution log in the dashboard. If it is empty, no live swap has been run from this repository yet.
+- **Agent runs on testnet and locally.** The Agent Studio agent is registered on BSC testnet with a `localhost` endpoint; it was not deployed to a public runtime (the managed platform requires Bun and is a 48-hour testnet trial). Its quotes still come from BSC mainnet through `baw`.
+- **x402 rail not enabled.** B402 merchant credentials are issued only after manual approval, so the agent uses the ERC-8183 escrow rail instead.
+- **No completed paid job yet.** Negotiation (wallet-signed quote) and the work hook were verified live; an end-to-end funded ERC-8183 job was not completed because the testnet U faucet had hit its monthly limit.
 
 ## License
 
