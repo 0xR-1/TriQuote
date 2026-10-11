@@ -52,6 +52,7 @@ All numbers below were produced by TriQuote against BSC mainnet, for a 5 USDT or
 - **Fill verification** — after a swap finishes, TriQuote measures the tokens actually received (wallet balance before vs after) and logs the real price per share against both the quote and the reference.
 - **Replay mode** — `scan --save` records a live scan; the dashboard can replay it with no wallet, so anyone can inspect real results.
 - **Live dashboard** — local web UI with KPIs, per-issuer cells (★ BEST / ☠ TOXIC / NO LIQUIDITY) and an execution log.
+- **OpenClaw skill** — `skills/triquote/SKILL.md` makes any OpenClaw agent check TriQuote before buying a tokenized stock, refuse toxic routes, and execute only through `triquote buy` after the user confirms.
 - **Agent-to-agent service** — a BNB Agent Studio seller agent (ERC-8004 identity **#2586**) that sells TriQuote route reports to other agents over A2A and MCP, paid through ERC-8183 escrow.
 
 ## Binance Web3 stack used
@@ -62,6 +63,7 @@ All numbers below were produced by TriQuote against BSC mainnet, for a 5 USDT or
 | **Tokenized securities registry** | `.../rwa/stock/detail/list/ai` — maps each ticker to its bStocks / Ondo / xStocks contracts and multipliers on BSC |
 | **Tokenized securities dynamic data** | `.../rwa/dynamic/ai` — live share multiplier, oracle token price, US stock price and market status per token |
 | **BNB Agent Studio (`bag` CLI)** | Seller agent scaffold, ERC-8004 identity registration, ERC-8183 signed quotes and escrowed delivery, A2A + MCP faces |
+| **OpenClaw** | `triquote` skill in the same `SKILL.md` format as Binance Skills Hub, gated on the `triquote` and `baw` binaries |
 
 ## Architecture
 
@@ -126,6 +128,42 @@ flowchart TD
 | `snapshots/` | Recorded live scans for replay |
 | `test/router.test.js` | `node --test` suite built on the live 10 Oct 2026 SPY quotes |
 | `public/index.html` | Dashboard UI (no external dependencies) |
+| `skills/triquote/SKILL.md` | OpenClaw skill: when to call TriQuote, routing rules, confirmed execution |
+
+## TriQuote as an OpenClaw skill
+
+`skills/triquote/SKILL.md` teaches an OpenClaw agent to use TriQuote whenever the user wants to buy or compare a tokenized US stock on BSC. The agent runs `triquote best <TICKER> --json`, explains the chosen issuer and any blocked routes, never routes to a `TOXIC` or `SUSPECT` quote, and executes only through `triquote buy ... --confirm` after the user explicitly approves, so every swap is re-quoted and re-graded right before it is sent.
+
+### Install
+
+```bash
+cd TriQuote
+npm link
+mkdir -p ~/.openclaw/workspace/skills
+cp -r skills/triquote ~/.openclaw/workspace/skills/triquote
+openclaw gateway restart
+openclaw skills list
+```
+
+`npm link` puts the `triquote` command on your `PATH`; the skill is gated on both `triquote` and `baw`, and shows as `✓ ready` in `openclaw skills list` once both are found.
+
+### Try it
+
+```bash
+openclaw agent --message "I want to buy 5 USDT of SPY on BSC. Which tokenized SPY should I buy and why? Do not execute any trade, only show me the route."
+```
+
+Excerpt of the agent's live answer (OpenClaw 2026.9.2, 11 Oct 2026):
+
+| Issuer | Token | Price/Share | Premium vs Reference | Grade |
+|--------|-------|-------------|---------------------|-------|
+| **Ondo** | **SPYon** | **$773.75** | **–73.8 bps** (discount) | ✅ **SAFE** |
+| bStocks | SPYB | $777.42 | –26.6 bps | ✅ SAFE |
+| xStocks | SPYx | $8,911.97 | **+104,330 bps** | ❌ TOXIC |
+
+> **Blocked route (TOXIC): xStocks (SPYx)** — Reasons: `REF_PREMIUM`, `ORACLE_DEVIATION`, `PEER_OUTLIER`, `MULTIPLIER_MISMATCH`. Loss avoided: ~$4.57 on a $5 order.
+>
+> Dry-run command if you want to proceed: `triquote buy SPY --usdt 5` (only executes with `--confirm` after you approve the route).
 
 ## TriQuote as an agent (BNB Agent Studio)
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { realpathSync } from "node:fs";
 import { appendFile, mkdir, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -336,7 +337,15 @@ async function main() {
   await command(positional, flags);
 }
 
-const isEntrypoint = process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+function resolveEntrypoint(path) {
+  try {
+    return realpathSync(path);
+  } catch {
+    return resolve(path);
+  }
+}
+
+const isEntrypoint = Boolean(process.argv[1]) && resolveEntrypoint(process.argv[1]) === realpathSync(fileURLToPath(import.meta.url));
 if (isEntrypoint) {
   main().catch((error) => {
     console.error(color.red(`Error: ${error.message}`));
